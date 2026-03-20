@@ -111,6 +111,14 @@ static MYSQL_THDVAR_ENUM(default_distance, PLUGIN_VAR_RQCMDARG,
        "Distance function to build the vector index for",
        nullptr, nullptr, EUCLIDEAN, &distances);
 
+enum search_mode_type : uint { HIERARCHICAL, FLAT };
+static const char *search_mode_names[]= { "hierarchical", "flat", nullptr };
+static TYPELIB search_modes= CREATE_TYPELIB_FOR(search_mode_names);
+static MYSQL_THDVAR_ENUM(search_mode, PLUGIN_VAR_RQCMDARG,
+       "Search algorithm: hierarchical (standard layer-by-layer) or "
+       "flat (one-pass cross-layer search)",
+       nullptr, nullptr, HIERARCHICAL, &search_modes);
+
 struct ha_index_option_struct
 {
   ulonglong M; // option struct does not support uint
@@ -1286,7 +1294,8 @@ static inline float generous_furthest(const Queue<Visited> &q, float maxd, float
   @param[in/out] inout    in: start nodes, out: result nodes
 */
 static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
-                        uint result_size, Neighborhood *inout, bool construction)
+                        uint result_size, Neighborhood *inout, bool construction,
+                        bool flat= false)
 {
   DBUG_ASSERT(inout->num > 0);
 
@@ -1310,7 +1319,11 @@ static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
   }
 
   // WARNING! heuristic here
-  const double est_heuristic= 8 * std::sqrt(p->ctx->max_neighbors(p->layer));
+  uint neighbors_per_node= p->ctx->max_neighbors(p->layer);
+  if (flat)
+    for (int l= p->layer - 1; l >= 0; l--)
+      neighbors_per_node += p->ctx->max_neighbors(l);
+  const double est_heuristic= 8 * std::sqrt(neighbors_per_node);
   double est_size= est_heuristic * std::pow(ef, p->acc.ef_power);
   est_size= std::min(est_size, p->max_est_size);
   VisitedSet visited(root, static_cast<uint>(est_size));
@@ -1340,48 +1353,64 @@ static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
 
     visited.flush();
 
-    Neighborhood &neighbors= cur.node->neighbors[p->layer];
-    FVectorNode **links= neighbors.links, **end= links + neighbors.num;
-    for (; links < end; links+= 8)
+    int start_layer, stop_layer;
+    if (flat)
     {
-      uint8_t res= visited.seen(links);
-      if (res == 0xff)
-        continue;
+      start_layer= std::min((int)cur.node->max_layer, p->layer);
+      stop_layer= 0;
+    }
+    else
+    {
+      start_layer= p->layer;
+      stop_layer= p->layer;
+    }
 
-      for (size_t i= 0; i < 8; i++)
+    for (int expand_layer= start_layer;
+         expand_layer >= stop_layer; expand_layer--)
+    {
+      Neighborhood &neighbors= cur.node->neighbors[expand_layer];
+      FVectorNode **links= neighbors.links, **end= links + neighbors.num;
+      for (; links < end; links+= 8)
       {
-        if (res & (1 << i))
+        uint8_t res= visited.seen(links);
+        if (res == 0xff)
           continue;
-        if (int err= links[i]->load(p->graph))
-          return err;
-        if (!best.is_full())
+
+        for (size_t i= 0; i < 8; i++)
         {
-          Visited *v= visited.create(links[i], links[i]->distance_to(target));
-          if (v->distance_to_target <= threshold)
+          if (res & (1 << i))
             continue;
-          p->acc.diameter= std::max(p->acc.diameter, v->distance_to_target);
-          candidates.safe_push(v);
-          if (skip_deleted && v->node->deleted)
-            continue;
-          best.push(v);
-          furthest_best= generous_furthest(best, p->acc.diameter, generosity);
-        }
-        else
-        {
-          Visited *v= visited.create(links[i],
-                        links[i]->distance_greater_than(target, furthest_best,
-                                                        p->mode, &p->acc));
-          if (v->distance_to_target <= threshold)
-            continue;
-          if (v->distance_to_target < furthest_best)
+          if (int err= links[i]->load(p->graph))
+            return err;
+          if (!best.is_full())
           {
+            Visited *v= visited.create(links[i], links[i]->distance_to(target));
+            if (v->distance_to_target <= threshold)
+              continue;
+            p->acc.diameter= std::max(p->acc.diameter, v->distance_to_target);
             candidates.safe_push(v);
             if (skip_deleted && v->node->deleted)
               continue;
-            if (v->distance_to_target < best.top()->distance_to_target)
+            best.push(v);
+            furthest_best= generous_furthest(best, p->acc.diameter, generosity);
+          }
+          else
+          {
+            Visited *v= visited.create(links[i],
+                          links[i]->distance_greater_than(target, furthest_best,
+                                                          p->mode, &p->acc));
+            if (v->distance_to_target <= threshold)
+              continue;
+            if (v->distance_to_target < furthest_best)
             {
-              best.replace_top(v);
-              furthest_best= generous_furthest(best, p->acc.diameter, generosity);
+              candidates.safe_push(v);
+              if (skip_deleted && v->node->deleted)
+                continue;
+              if (v->distance_to_target < best.top()->distance_to_target)
+              {
+                best.replace_top(v);
+                furthest_best= generous_furthest(best, p->acc.diameter, generosity);
+              }
             }
           }
         }
@@ -1566,18 +1595,22 @@ int mhnsw_read_first(TABLE *table, KEY *keyinfo, Item *dist, ulonglong limit)
     return err;
 
   MHNSW_param p(ctx, graph, candidates.links[0]->max_layer);
+  bool flat= static_cast<search_mode_type>(THDVAR(thd, search_mode)) == FLAT;
 
-  for (; p.layer > 0; p.layer--)
-  {
-    if (int err= search_layer(&p, target, NEAREST, 1, &candidates, false))
+  if (flat)
+    p.layer= 0;
+  else
+    for (; p.layer > 0; p.layer--)
     {
-      graph->file->ha_rnd_end();
-      return err;
+      if (int err= search_layer(&p, target, NEAREST, 1, &candidates, false))
+      {
+        graph->file->ha_rnd_end();
+        return err;
+      }
     }
-  }
 
   if (int err= search_layer(&p, target, NEAREST, static_cast<uint>(limit),
-                            &candidates, false))
+                            &candidates, false, flat))
   {
     graph->file->ha_rnd_end();
     return err;
@@ -1792,6 +1825,7 @@ static struct st_mysql_sys_var *mhnsw_sys_vars[]=
   MYSQL_SYSVAR(default_m),
   MYSQL_SYSVAR(default_distance),
   MYSQL_SYSVAR(ef_search),
+  MYSQL_SYSVAR(search_mode),
   NULL
 };
 
