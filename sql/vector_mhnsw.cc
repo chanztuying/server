@@ -112,7 +112,8 @@ static MYSQL_THDVAR_ENUM(default_distance, PLUGIN_VAR_RQCMDARG,
        nullptr, nullptr, EUCLIDEAN, &distances);
 
 enum search_mode_type : uint { HIERARCHICAL, FLAT };
-static const char *search_mode_names[]= { "hierarchical", "flat", nullptr };
+static const char *search_mode_names[]=
+  { "hierarchical", "flat", nullptr };
 static TYPELIB search_modes= CREATE_TYPELIB_FOR(search_mode_names);
 static MYSQL_THDVAR_ENUM(search_mode, PLUGIN_VAR_RQCMDARG,
        "Search algorithm: hierarchical (standard layer-by-layer) or "
@@ -1317,11 +1318,10 @@ static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
     if (ef > 1 || p->layer == 0)
       ef= std::max(THDVAR(p->graph->in_use, ef_search), ef);
   }
-
   // WARNING! heuristic here
   uint neighbors_per_node= p->ctx->max_neighbors(p->layer);
   if (flat)
-    for (int l= p->layer - 1; l >= 0; l--)
+    for (uint l= 1; l <= p->ctx->start->max_layer; l++)
       neighbors_per_node += p->ctx->max_neighbors(l);
   const double est_heuristic= 8 * std::sqrt(neighbors_per_node);
   double est_size= est_heuristic * std::pow(ef, p->acc.ef_power);
@@ -1351,12 +1351,10 @@ static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
     if (cur.distance_to_target > furthest_best && best.is_full())
       break; // All possible candidates are worse than what we have
 
-    visited.flush();
-
     int start_layer, stop_layer;
     if (flat)
     {
-      start_layer= std::min((int)cur.node->max_layer, p->layer);
+      start_layer= cur.node->max_layer;
       stop_layer= 0;
     }
     else
@@ -1368,6 +1366,7 @@ static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
     for (int expand_layer= start_layer;
          expand_layer >= stop_layer; expand_layer--)
     {
+      visited.flush();
       Neighborhood &neighbors= cur.node->neighbors[expand_layer];
       FVectorNode **links= neighbors.links, **end= links + neighbors.num;
       for (; links < end; links+= 8)
@@ -1595,11 +1594,12 @@ int mhnsw_read_first(TABLE *table, KEY *keyinfo, Item *dist, ulonglong limit)
     return err;
 
   MHNSW_param p(ctx, graph, candidates.links[0]->max_layer);
-  bool flat= static_cast<search_mode_type>(THDVAR(thd, search_mode)) == FLAT;
+  bool flat= THDVAR(thd, search_mode) == FLAT;
 
   if (flat)
     p.layer= 0;
   else
+  {
     for (; p.layer > 0; p.layer--)
     {
       if (int err= search_layer(&p, target, NEAREST, 1, &candidates, false))
@@ -1608,6 +1608,7 @@ int mhnsw_read_first(TABLE *table, KEY *keyinfo, Item *dist, ulonglong limit)
         return err;
       }
     }
+  }
 
   if (int err= search_layer(&p, target, NEAREST, static_cast<uint>(limit),
                             &candidates, false, flat))
