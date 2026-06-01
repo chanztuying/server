@@ -111,13 +111,14 @@ static MYSQL_THDVAR_ENUM(default_distance, PLUGIN_VAR_RQCMDARG,
        "Distance function to build the vector index for",
        nullptr, nullptr, EUCLIDEAN, &distances);
 
-enum search_mode_type : uint { HIERARCHICAL, FLAT };
+enum search_mode_type : uint { HIERARCHICAL, FLAT, FLAT_PRUNED };
 static const char *search_mode_names[]=
-  { "hierarchical", "flat", nullptr };
+  { "hierarchical", "flat", "flat_pruned", nullptr };
 static TYPELIB search_modes= CREATE_TYPELIB_FOR(search_mode_names);
 static MYSQL_THDVAR_ENUM(search_mode, PLUGIN_VAR_RQCMDARG,
-       "Search algorithm: hierarchical (standard layer-by-layer) or "
-       "flat (one-pass cross-layer search)",
+       "Search algorithm: hierarchical (standard layer-by-layer), "
+       "flat (one-pass cross-layer search), or flat_pruned (one-pass that "
+       "stops descending a node's layers once a layer no longer improves)",
        nullptr, nullptr, HIERARCHICAL, &search_modes);
 
 struct ha_index_option_struct
@@ -1077,6 +1078,7 @@ struct MHNSW_param
   Stats acc;
   dgt_mode mode;
   double max_est_size;
+  ulong dist_calcs= 0;  // distance computations accumulated over this query
   MHNSW_param(MHNSW_Share *ctx, TABLE *graph, int layer)
     : ctx(ctx), graph(graph), layer(layer)
   {
@@ -1296,7 +1298,7 @@ static inline float generous_furthest(const Queue<Visited> &q, float maxd, float
 */
 static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
                         uint result_size, Neighborhood *inout, bool construction,
-                        bool flat= false)
+                        bool flat= false, bool prune= false)
 {
   DBUG_ASSERT(inout->num > 0);
 
@@ -1363,10 +1365,12 @@ static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
       stop_layer= p->layer;
     }
 
+    float prev_layer_min= FLT_MAX;
     for (int expand_layer= start_layer;
          expand_layer >= stop_layer; expand_layer--)
     {
       visited.flush();
+      float layer_min= FLT_MAX;   // min distance among NEW neighbors of this layer
       Neighborhood &neighbors= cur.node->neighbors[expand_layer];
       FVectorNode **links= neighbors.links, **end= links + neighbors.num;
       for (; links < end; links+= 8)
@@ -1384,6 +1388,7 @@ static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
           if (!best.is_full())
           {
             Visited *v= visited.create(links[i], links[i]->distance_to(target));
+            layer_min= std::min(layer_min, v->distance_to_target);
             if (v->distance_to_target <= threshold)
               continue;
             p->acc.diameter= std::max(p->acc.diameter, v->distance_to_target);
@@ -1398,6 +1403,7 @@ static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
             Visited *v= visited.create(links[i],
                           links[i]->distance_greater_than(target, furthest_best,
                                                           p->mode, &p->acc));
+            layer_min= std::min(layer_min, v->distance_to_target);
             if (v->distance_to_target <= threshold)
               continue;
             if (v->distance_to_target < furthest_best)
@@ -1414,8 +1420,22 @@ static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
           }
         }
       }
+
+      // One-pass pruning (MDEV-38721): after finishing this layer, descend to
+      // the next lower one only if it produced a NEW neighbor closer to target
+      // than the closest NEW neighbor on the layer above. layer_min == FLT_MAX
+      // means no new neighbor was evaluated here (e.g. all already visited) --
+      // never prune then, so the dense lower layers (esp. layer 0) aren't
+      // skipped. The top layer always passes (prev_layer_min starts FLT_MAX).
+      if (prune && layer_min != FLT_MAX)
+      {
+        if (layer_min >= prev_layer_min)
+          break;
+        prev_layer_min= layer_min;
+      }
     }
   }
+  p->dist_calcs+= visited.count;
   if (ef > 1 && visited.count > est_size)
   {
     double ef_power= std::log(visited.count/est_heuristic) / std::log(ef);
@@ -1594,7 +1614,9 @@ int mhnsw_read_first(TABLE *table, KEY *keyinfo, Item *dist, ulonglong limit)
     return err;
 
   MHNSW_param p(ctx, graph, candidates.links[0]->max_layer);
-  bool flat= THDVAR(thd, search_mode) == FLAT;
+  uint search_mode_val= THDVAR(thd, search_mode);
+  bool flat= search_mode_val != HIERARCHICAL;
+  bool prune= search_mode_val == FLAT_PRUNED;
 
   if (flat)
     p.layer= 0;
@@ -1611,12 +1633,13 @@ int mhnsw_read_first(TABLE *table, KEY *keyinfo, Item *dist, ulonglong limit)
   }
 
   if (int err= search_layer(&p, target, NEAREST, static_cast<uint>(limit),
-                            &candidates, false, flat))
+                            &candidates, false, flat, prune))
   {
     graph->file->ha_rnd_end();
     return err;
   }
   ctx->add_to_stats(p.acc);
+  status_var_add(thd->status_var.ha_mhnsw_search_dist_calc, p.dist_calcs);
 
   auto result= new (thd->mem_root) Search_context(&candidates, ctx, target);
   graph->context= result;
