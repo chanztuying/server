@@ -36,10 +36,7 @@ static constexpr float subdist_margin= 1.05f;
 static constexpr double subdist_stddev_threshold= 0.05;  // 3σ, p>99.9%
 static constexpr ulonglong subdist_stddev_valid= 10000;  // sufficient
 
-// FLAT_PRUNED (MDEV-38721): consecutive non-improving layers to tolerate before
-// abandoning a node's descent. 0 == the original greedy rule (stop at the first
-// non-improvement); >0 catches a non-monotonic dip where a lower layer resumes
-// improving, recovering recall the greedy rule loses.
+// FLAT_PRUNED: non-improving layers to tolerate before abandoning descent (0 = greedy)
 static constexpr uint flat_prune_patience= 1;
 
 /*
@@ -1372,7 +1369,7 @@ static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
     }
 
     float prev_layer_min= FLT_MAX;
-    uint stall= 0;   // consecutive non-improving layers (FLAT_PRUNED patience)
+    uint stall= 0;   // consecutive non-improving layers (patience)
     for (int expand_layer= start_layer;
          expand_layer >= stop_layer; expand_layer--)
     {
@@ -1387,23 +1384,13 @@ static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
           continue;
 
 #if defined(__GNUC__)
-        /*
-          Overlap the unseen lanes' DRAM latency with the distance
-          computations below. Per unseen neighbor the CPU otherwise does a
-          serialized dependent chase: links[i] -> FVectorNode header (for
-          the vec pointer in load()) -> vector data. The node and its
-          vector are ONE allocation (see alloc_node_internal), so two
-          cache lines cover both chase targets without dereferencing
-          anything. Architecturally invisible: results, traversal order
-          and distance-calc counts are unchanged. Same idiom as InnoDB's
-          UNIV_PREFETCH_R (univ.i).
-        */
+        // prefetch unseen neighbors' node+vector (one alloc, 2 cache lines) so their
+        // DRAM latency overlaps the distance computations below
         for (size_t i= 0; i < 8; i++)
           if (!(res & (1 << i)))
           {
             __builtin_prefetch(links[i], 0, 3);
-            __builtin_prefetch(reinterpret_cast<const char*>(links[i]) + 64,
-                               0, 3);
+            __builtin_prefetch(reinterpret_cast<const char*>(links[i]) + 64, 0, 3);
           }
 #endif
 
@@ -1465,7 +1452,7 @@ static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
         else
         {
           stall= 0;                            // improvement resumed
-          prev_layer_min= layer_min;           // bar stays at the best seen
+          prev_layer_min= layer_min;
         }
       }
     }
