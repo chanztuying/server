@@ -1347,6 +1347,17 @@ static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
       if (res == 0xff)
         continue;
 
+#if defined(__GNUC__)
+      // prefetch unseen neighbors' node+vector (one alloc, 2 cache lines) so their
+      // DRAM latency overlaps the distance computations below
+      for (size_t i= 0; i < 8; i++)
+        if (!(res & (1 << i)))
+        {
+          __builtin_prefetch(links[i], 0, 3);
+          __builtin_prefetch(reinterpret_cast<const char*>(links[i]) + 64, 0, 3);
+        }
+#endif
+
       for (size_t i= 0; i < 8; i++)
       {
         if (res & (1 << i))
