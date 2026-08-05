@@ -1,0 +1,198 @@
+#
+# MDEV-38721: flat_pruned (one-pass cross-layer) vector search mode
+#
+--source include/have_sequence.inc
+
+--echo #
+--echo # mhnsw_search_mode
+--echo #
+select @@mhnsw_search_mode;
+set mhnsw_search_mode='flat_pruned';
+select @@mhnsw_search_mode;
+set mhnsw_search_mode='hierarchical';
+select @@mhnsw_search_mode;
+# flat (one-pass without pruning) is a debug-build diagnostic, not a mode
+--error ER_WRONG_VALUE_FOR_VAR
+set mhnsw_search_mode='flat';
+--error ER_WRONG_VALUE_FOR_VAR
+set mhnsw_search_mode='no_such_mode';
+set mhnsw_search_mode=default;
+select @@mhnsw_search_mode;
+
+--echo #
+--echo # Small dataset, euclidean: same answer as the brute force scan
+--echo #
+set rand_seed1=1, rand_seed2=2;
+create table t1 (id int auto_increment primary key, v vector(5) not null, vector index (v));
+insert t1 (v) values (x'e360d63ebe554f3fcdbc523f4522193f5236083d'),
+                     (x'f511303f72224a3fdd05fe3eb22a133ffae86a3f'),
+                     (x'f09baa3ea172763f123def3e0c7fe53e288bf33e'),
+                     (x'b97a523f2a193e3eb4f62e3f2d23583e9dd60d3f'),
+                     (x'f7c5df3e984b2b3e65e59d3d7376db3eac63773e'),
+                     (x'de01453ffa486d3f10aa4d3fdd66813c71cb163f'),
+                     (x'76edfc3e4b57243f10f8423fb158713f020bda3e'),
+                     (x'56926c3fdf098d3e2c8c5e3d1ad4953daa9d0b3e'),
+                     (x'7b713f3e5258323f80d1113d673b2b3f66e3583f'),
+                     (x'6ca1d43e9df91b3fe580da3e1c247d3f147cf33e');
+
+--echo # brute force
+--replace_regex /(\.\d{5})\d+/\1/
+select id, vec_distance_euclidean(v, x'B047263c9f87233fcfd27e3eae493e3f0329f43e') d from t1 ignore index (v) order by d limit 5;
+
+--echo # hierarchical
+set mhnsw_search_mode='hierarchical';
+--replace_regex /(\.\d{5})\d+/\1/
+select id, vec_distance_euclidean(v, x'B047263c9f87233fcfd27e3eae493e3f0329f43e') d from t1 order by d limit 5;
+
+--echo # flat_pruned
+set mhnsw_search_mode='flat_pruned';
+--replace_regex /(\.\d{5})\d+/\1/
+select id, vec_distance_euclidean(v, x'B047263c9f87233fcfd27e3eae493e3f0329f43e') d from t1 order by d limit 5;
+
+drop table t1;
+
+# ANN results on generated graphs are compared as a recall floor against the
+# brute force answer, not row by row: the visited-set filter hashes node
+# addresses, so the exact set is not guaranteed to be reproducible.
+create temporary table res (id int not null);
+create temporary table brute_ids (id int not null);
+
+--echo #
+--echo # Cosine distance
+--echo #
+set rand_seed1=3, rand_seed2=4;
+create table t1 (id int auto_increment primary key, v vector(5) not null,
+                 vector index (v) distance=cosine);
+insert into t1 (v) select vec_fromtext(json_arrayagg(rand()-0.5 order by veclen.seq)) from seq_1_to_5 veclen, seq_1_to_300 numvecs group by numvecs.seq;
+insert into brute_ids (id) select id from t1 ignore index (v) order by vec_distance_cosine(v, (select v from t1 where id=1)) limit 5;
+
+set mhnsw_search_mode='hierarchical';
+insert into res (id) select id from t1 order by vec_distance_cosine(v, (select v from t1 where id=1)) limit 5;
+--echo # hierarchical
+select count(*) >= 3 as recall_at_least_3 from res join brute_ids using (id);
+truncate table res;
+
+set mhnsw_search_mode='flat_pruned';
+insert into res (id) select id from t1 order by vec_distance_cosine(v, (select v from t1 where id=1)) limit 5;
+--echo # flat_pruned
+select count(*) >= 3 as recall_at_least_3 from res join brute_ids using (id);
+truncate table res;
+truncate table brute_ids;
+
+drop table t1;
+
+--echo #
+--echo # Deleted rows are not returned
+--echo #
+set rand_seed1=7, rand_seed2=8;
+create table t1 (id int auto_increment primary key, v vector(5) not null, vector index (v));
+insert into t1 (v) select vec_fromtext(json_arrayagg(rand() order by veclen.seq)) from seq_1_to_5 veclen, seq_1_to_300 numvecs group by numvecs.seq;
+delete from t1 where id % 3 = 0;
+insert into brute_ids (id) select id from t1 ignore index (v) order by vec_distance_euclidean(v, (select v from t1 where id=1)) limit 10;
+
+set mhnsw_search_mode='flat_pruned';
+insert into res (id) select id from t1 order by vec_distance_euclidean(v, (select v from t1 where id=1)) limit 10;
+--echo # deleted rows returned
+select count(*) from res where id % 3 = 0;
+--echo # rows returned
+select count(*) from res;
+--echo # recall
+select count(*) >= 6 as recall_at_least_6 from res join brute_ids using (id);
+truncate table res;
+truncate table brute_ids;
+
+drop table t1;
+
+--echo #
+--echo # M other than the default 6 (M<6 disables the greedy upper-layer entry)
+--echo #
+set rand_seed1=11, rand_seed2=12;
+create table t1 (id int auto_increment primary key, v vector(5) not null, vector index (v) m=10);
+insert into t1 (v) select vec_fromtext(json_arrayagg(rand() order by veclen.seq)) from seq_1_to_5 veclen, seq_1_to_300 numvecs group by numvecs.seq;
+insert into brute_ids (id) select id from t1 ignore index (v) order by vec_distance_euclidean(v, (select v from t1 where id=1)) limit 5;
+set mhnsw_search_mode='flat_pruned';
+insert into res (id) select id from t1 order by vec_distance_euclidean(v, (select v from t1 where id=1)) limit 5;
+--echo # m=10
+select count(*) >= 3 as recall_at_least_3 from res join brute_ids using (id);
+truncate table res;
+truncate table brute_ids;
+drop table t1;
+
+set rand_seed1=13, rand_seed2=14;
+create table t1 (id int auto_increment primary key, v vector(5) not null, vector index (v) m=3);
+insert into t1 (v) select vec_fromtext(json_arrayagg(rand() order by veclen.seq)) from seq_1_to_5 veclen, seq_1_to_300 numvecs group by numvecs.seq;
+insert into brute_ids (id) select id from t1 ignore index (v) order by vec_distance_euclidean(v, (select v from t1 where id=1)) limit 5;
+set mhnsw_search_mode='flat_pruned';
+insert into res (id) select id from t1 order by vec_distance_euclidean(v, (select v from t1 where id=1)) limit 5;
+--echo # m=3
+select count(*) >= 3 as recall_at_least_3 from res join brute_ids using (id);
+truncate table res;
+truncate table brute_ids;
+drop table t1;
+
+--echo #
+--echo # Continuation: a filtered LIMIT keeps reading past the first batch
+--echo #
+set rand_seed1=10, rand_seed2=20;
+create table t2 (id int auto_increment primary key, v vector(10) not null, vector index (v));
+insert into t2 (v) select vec_fromtext(json_arrayagg(rand() order by veclen.seq)) from seq_1_to_10 veclen, seq_1_to_500 numvecs group by numvecs.seq;
+
+set mhnsw_ef_search=2;
+set mhnsw_search_mode='flat_pruned';
+let $b= query_get_value(SHOW SESSION STATUS LIKE 'Mhnsw_search_distance_calc', Value, 1);
+insert into res (id) select id from t2 where id % 7 = 0 order by vec_distance_euclidean(v, (select v from t2 where id=1)) limit 5;
+let $a= query_get_value(SHOW SESSION STATUS LIKE 'Mhnsw_search_distance_calc', Value, 1);
+let $indexed= `select $a > $b`;
+echo # vector index used: $indexed;
+--echo # rows returned
+select count(*) from res;
+--echo # all match the WHERE clause
+select count(*) from res where id % 7 <> 0;
+truncate table res;
+set mhnsw_ef_search=default;
+
+--echo #
+--echo # Mhnsw_search_distance_calc counts index searches only
+--echo #
+set mhnsw_search_mode='flat_pruned';
+let $b= query_get_value(SHOW SESSION STATUS LIKE 'Mhnsw_search_distance_calc', Value, 1);
+--disable_result_log
+select id from t2 order by vec_distance_euclidean(v, (select v from t2 where id=1)) limit 5;
+--enable_result_log
+let $a= query_get_value(SHOW SESSION STATUS LIKE 'Mhnsw_search_distance_calc', Value, 1);
+let $indexed= `select $a > $b`;
+echo # indexed search counted: $indexed;
+
+let $b= query_get_value(SHOW SESSION STATUS LIKE 'Mhnsw_search_distance_calc', Value, 1);
+--disable_result_log
+select id from t2 ignore index (v) order by vec_distance_euclidean(v, (select v from t2 where id=1)) limit 5;
+--enable_result_log
+let $a= query_get_value(SHOW SESSION STATUS LIKE 'Mhnsw_search_distance_calc', Value, 1);
+let $brute= `select $a = $b`;
+echo # brute force not counted: $brute;
+
+drop table t2;
+
+--echo #
+--echo # Larger dataset with deeper layers
+--echo #
+set rand_seed1=100, rand_seed2=200;
+create table t3 (id int auto_increment primary key, v vector(50) not null, vector index (v));
+insert into t3 (v) select vec_fromtext(json_arrayagg(rand() order by veclen.seq)) from seq_1_to_50 veclen, seq_1_to_2000 numvecs group by numvecs.seq;
+insert into brute_ids (id) select id from t3 ignore index (v) order by vec_distance_euclidean(v, (select v from t3 where id=1)) limit 5;
+
+set mhnsw_search_mode='hierarchical';
+insert into res (id) select id from t3 order by vec_distance_euclidean(v, (select v from t3 where id=1)) limit 5;
+--echo # hierarchical
+select count(*) >= 3 as recall_at_least_3 from res join brute_ids using (id);
+truncate table res;
+
+set mhnsw_search_mode='flat_pruned';
+insert into res (id) select id from t3 order by vec_distance_euclidean(v, (select v from t3 where id=1)) limit 5;
+--echo # flat_pruned
+select count(*) >= 3 as recall_at_least_3 from res join brute_ids using (id);
+truncate table res;
+
+drop temporary table res, brute_ids;
+drop table t3;
+set mhnsw_search_mode=default;
