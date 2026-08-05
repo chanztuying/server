@@ -1068,6 +1068,7 @@ struct MHNSW_param
   Stats acc;
   dgt_mode mode;
   double max_est_size;
+  ulong dist_calcs= 0;  // distance computations accumulated over this query
   MHNSW_param(MHNSW_Share *ctx, TABLE *graph, int layer)
     : ctx(ctx), graph(graph), layer(layer)
   {
@@ -1398,6 +1399,7 @@ static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
       }
     }
   }
+  p->dist_calcs+= visited.count;
   if (ef > 1 && visited.count > est_size)
   {
     double ef_power= std::log(visited.count/est_heuristic) / std::log(ef);
@@ -1593,6 +1595,7 @@ int mhnsw_read_first(TABLE *table, KEY *keyinfo, Item *dist, ulonglong limit)
     return err;
   }
   ctx->add_to_stats(p.acc);
+  status_var_add(thd->status_var.ha_mhnsw_search_dist_calc, p.dist_calcs);
 
   auto result= new (thd->mem_root) Search_context(&candidates, ctx, target);
   graph->context= result;
