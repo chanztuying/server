@@ -1008,6 +1008,7 @@ typedef struct system_status_var
   ulong ha_read_rnd_count;
   ulong ha_read_rnd_next_count;
   ulong ha_read_rnd_deleted_count;
+  ulong ha_mhnsw_search_dist_calc;
 
   /*
     This number doesn't include calls to the default implementation and
