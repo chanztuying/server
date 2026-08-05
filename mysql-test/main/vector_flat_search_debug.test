@@ -1,0 +1,42 @@
+#
+# MDEV-38721: debug-only diagnostics of the flat_pruned search mode
+#
+--source include/have_debug.inc
+--source include/have_sequence.inc
+
+set rand_seed1=100, rand_seed2=200;
+create table t1 (id int auto_increment primary key, v vector(50) not null, vector index (v));
+insert into t1 (v) select vec_fromtext(json_arrayagg(rand() order by veclen.seq)) from seq_1_to_50 veclen, seq_1_to_2000 numvecs group by numvecs.seq;
+
+create temporary table res (id int not null);
+create temporary table brute_ids (id int not null);
+insert into brute_ids (id) select id from t1 ignore index (v) order by vec_distance_euclidean(v, (select v from t1 where id=1)) limit 5;
+
+--echo #
+--echo # flat: one-pass without pruning
+--echo #
+set mhnsw_search_mode='flat_pruned';
+set debug_dbug='+d,mhnsw_flat_no_prune';
+insert into res (id) select id from t1 order by vec_distance_euclidean(v, (select v from t1 where id=1)) limit 5;
+set debug_dbug='';
+select count(*) >= 3 as recall_at_least_3 from res join brute_ids using (id);
+truncate table res;
+
+--echo #
+--echo # Greedy upper-layer entry: forced stop heights
+--echo #
+let $stop= 0;
+while ($stop < 3)
+{
+  eval set debug_dbug='+d,mhnsw_flat_descent_stop_$stop';
+  insert into res (id) select id from t1 order by vec_distance_euclidean(v, (select v from t1 where id=1)) limit 5;
+  set debug_dbug='';
+  --echo # descent stop $stop
+  select count(*) >= 3 as recall_at_least_3 from res join brute_ids using (id);
+  truncate table res;
+  inc $stop;
+}
+
+drop temporary table res, brute_ids;
+drop table t1;
+set mhnsw_search_mode=default;

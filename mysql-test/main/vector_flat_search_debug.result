@@ -1,0 +1,47 @@
+set rand_seed1=100, rand_seed2=200;
+create table t1 (id int auto_increment primary key, v vector(50) not null, vector index (v));
+insert into t1 (v) select vec_fromtext(json_arrayagg(rand() order by veclen.seq)) from seq_1_to_50 veclen, seq_1_to_2000 numvecs group by numvecs.seq;
+create temporary table res (id int not null);
+create temporary table brute_ids (id int not null);
+insert into brute_ids (id) select id from t1 ignore index (v) order by vec_distance_euclidean(v, (select v from t1 where id=1)) limit 5;
+#
+# flat: one-pass without pruning
+#
+set mhnsw_search_mode='flat_pruned';
+set debug_dbug='+d,mhnsw_flat_no_prune';
+insert into res (id) select id from t1 order by vec_distance_euclidean(v, (select v from t1 where id=1)) limit 5;
+set debug_dbug='';
+select count(*) >= 3 as recall_at_least_3 from res join brute_ids using (id);
+recall_at_least_3
+1
+truncate table res;
+#
+# Greedy upper-layer entry: forced stop heights
+#
+set debug_dbug='+d,mhnsw_flat_descent_stop_0';
+insert into res (id) select id from t1 order by vec_distance_euclidean(v, (select v from t1 where id=1)) limit 5;
+set debug_dbug='';
+# descent stop 0
+select count(*) >= 3 as recall_at_least_3 from res join brute_ids using (id);
+recall_at_least_3
+1
+truncate table res;
+set debug_dbug='+d,mhnsw_flat_descent_stop_1';
+insert into res (id) select id from t1 order by vec_distance_euclidean(v, (select v from t1 where id=1)) limit 5;
+set debug_dbug='';
+# descent stop 1
+select count(*) >= 3 as recall_at_least_3 from res join brute_ids using (id);
+recall_at_least_3
+1
+truncate table res;
+set debug_dbug='+d,mhnsw_flat_descent_stop_2';
+insert into res (id) select id from t1 order by vec_distance_euclidean(v, (select v from t1 where id=1)) limit 5;
+set debug_dbug='';
+# descent stop 2
+select count(*) >= 3 as recall_at_least_3 from res join brute_ids using (id);
+recall_at_least_3
+1
+truncate table res;
+drop temporary table res, brute_ids;
+drop table t1;
+set mhnsw_search_mode=default;
