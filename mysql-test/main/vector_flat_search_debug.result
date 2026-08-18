@@ -1,0 +1,170 @@
+create temporary table res (id int not null);
+create temporary table brute_ids (id int not null);
+# Small Euclidean graph
+create table t1 (id int auto_increment primary key, v vector(5) not null,
+vector index (v));
+insert t1 (v) values (x'e360d63ebe554f3fcdbc523f4522193f5236083d'),
+(x'f511303f72224a3fdd05fe3eb22a133ffae86a3f'),
+(x'f09baa3ea172763f123def3e0c7fe53e288bf33e'),
+(x'b97a523f2a193e3eb4f62e3f2d23583e9dd60d3f'),
+(x'f7c5df3e984b2b3e65e59d3d7376db3eac63773e'),
+(x'de01453ffa486d3f10aa4d3fdd66813c71cb163f'),
+(x'76edfc3e4b57243f10f8423fb158713f020bda3e'),
+(x'56926c3fdf098d3e2c8c5e3d1ad4953daa9d0b3e'),
+(x'7b713f3e5258323f80d1113d673b2b3f66e3583f'),
+(x'6ca1d43e9df91b3fe580da3e1c247d3f147cf33e');
+# hierarchical
+select id, vec_distance_euclidean(v, x'B047263c9f87233fcfd27e3eae493e3f0329f43e') d
+from t1 order by d limit 5;
+id	d
+9	0.47199
+10	0.50690
+3	0.58656
+7	0.73444
+5	0.76710
+# flat_pruned
+set debug_dbug='+d,mhnsw_flat_pruned';
+select id, vec_distance_euclidean(v, x'B047263c9f87233fcfd27e3eae493e3f0329f43e') d
+from t1 order by d limit 5;
+id	d
+9	0.47199
+10	0.50690
+3	0.58656
+7	0.73444
+5	0.76710
+set debug_dbug='';
+drop table t1;
+# Cosine distance
+set rand_seed1=3, rand_seed2=4;
+create table t1 (id int auto_increment primary key, v vector(5) not null,
+vector index (v) distance=cosine);
+insert into t1 (v)
+select vec_fromtext(json_arrayagg(rand()-0.5 order by veclen.seq))
+from seq_1_to_5 veclen, seq_1_to_300 numvecs group by numvecs.seq;
+insert into brute_ids (id)
+select id from t1 ignore index (v)
+order by vec_distance_cosine(v, (select v from t1 where id=1)) limit 5;
+set debug_dbug='+d,mhnsw_flat_pruned';
+insert into res (id)
+select id from t1
+order by vec_distance_cosine(v, (select v from t1 where id=1)) limit 5;
+set debug_dbug='';
+select count(*) >= 3 as recall_at_least_3 from res join brute_ids using (id);
+recall_at_least_3
+1
+truncate table res;
+truncate table brute_ids;
+drop table t1;
+# Deleted rows are not returned
+set rand_seed1=7, rand_seed2=8;
+create table t1 (id int auto_increment primary key, v vector(5) not null,
+vector index (v));
+insert into t1 (v)
+select vec_fromtext(json_arrayagg(rand() order by veclen.seq))
+from seq_1_to_5 veclen, seq_1_to_300 numvecs group by numvecs.seq;
+delete from t1 where id % 3 = 0;
+set debug_dbug='+d,mhnsw_flat_pruned';
+insert into res (id)
+select id from t1
+order by vec_distance_euclidean(v, (select v from t1 where id=1)) limit 10;
+set debug_dbug='';
+select count(*) as deleted_rows from res where id % 3 = 0;
+deleted_rows
+0
+select count(*) as rows_returned from res;
+rows_returned
+10
+truncate table res;
+drop table t1;
+# Prefix disabled for M=3
+set rand_seed1=13, rand_seed2=14;
+create table t1 (id int auto_increment primary key, v vector(5) not null,
+vector index (v) m=3);
+insert into t1 (v)
+select vec_fromtext(json_arrayagg(rand() order by veclen.seq))
+from seq_1_to_5 veclen, seq_1_to_300 numvecs group by numvecs.seq;
+insert into brute_ids (id)
+select id from t1 ignore index (v)
+order by vec_distance_euclidean(v, (select v from t1 where id=1)) limit 5;
+set debug_dbug='+d,mhnsw_flat_pruned';
+insert into res (id)
+select id from t1
+order by vec_distance_euclidean(v, (select v from t1 where id=1)) limit 5;
+set debug_dbug='';
+select count(*) >= 3 as recall_at_least_3 from res join brute_ids using (id);
+recall_at_least_3
+1
+truncate table res;
+truncate table brute_ids;
+drop table t1;
+# Prefix enabled for M=10
+set rand_seed1=11, rand_seed2=12;
+create table t1 (id int auto_increment primary key, v vector(5) not null,
+vector index (v) m=10);
+insert into t1 (v)
+select vec_fromtext(json_arrayagg(rand() order by veclen.seq))
+from seq_1_to_5 veclen, seq_1_to_300 numvecs group by numvecs.seq;
+insert into brute_ids (id)
+select id from t1 ignore index (v)
+order by vec_distance_euclidean(v, (select v from t1 where id=1)) limit 5;
+set debug_dbug='+d,mhnsw_flat_pruned';
+insert into res (id)
+select id from t1
+order by vec_distance_euclidean(v, (select v from t1 where id=1)) limit 5;
+set debug_dbug='';
+select count(*) >= 3 as recall_at_least_3 from res join brute_ids using (id);
+recall_at_least_3
+1
+truncate table res;
+truncate table brute_ids;
+drop table t1;
+# Filtered continuation uses the vector index
+set rand_seed1=10, rand_seed2=20;
+create table t2 (id int auto_increment primary key, v vector(10) not null,
+vector index (v));
+insert into t2 (v)
+select vec_fromtext(json_arrayagg(rand() order by veclen.seq))
+from seq_1_to_10 veclen, seq_1_to_500 numvecs group by numvecs.seq;
+set mhnsw_ef_search=2;
+flush session status;
+set debug_dbug='+d,mhnsw_flat_pruned';
+select id from t2 where id % 7 = 0
+order by vec_distance_euclidean(v, (select v from t2 where id=1)) limit 5;
+set debug_dbug='';
+show session status like 'Handler_read_rnd_next';
+Variable_name	Value
+Handler_read_rnd_next	0
+set debug_dbug='+d,mhnsw_flat_pruned';
+insert into res (id)
+select id from t2 where id % 7 = 0
+order by vec_distance_euclidean(v, (select v from t2 where id=1)) limit 5;
+set debug_dbug='';
+select count(*) as rows_returned from res;
+rows_returned
+5
+select count(*) as rows_failing_filter from res where id % 7 <> 0;
+rows_failing_filter
+0
+truncate table res;
+set mhnsw_ef_search=default;
+drop table t2;
+# Deeper graph
+set rand_seed1=100, rand_seed2=200;
+create table t3 (id int auto_increment primary key, v vector(50) not null,
+vector index (v));
+insert into t3 (v)
+select vec_fromtext(json_arrayagg(rand() order by veclen.seq))
+from seq_1_to_50 veclen, seq_1_to_2000 numvecs group by numvecs.seq;
+insert into brute_ids (id)
+select id from t3 ignore index (v)
+order by vec_distance_euclidean(v, (select v from t3 where id=1)) limit 5;
+set debug_dbug='+d,mhnsw_flat_pruned';
+insert into res (id)
+select id from t3
+order by vec_distance_euclidean(v, (select v from t3 where id=1)) limit 5;
+set debug_dbug='';
+select count(*) >= 3 as recall_at_least_3 from res join brute_ids using (id);
+recall_at_least_3
+1
+drop temporary table res, brute_ids;
+drop table t3;

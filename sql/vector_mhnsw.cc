@@ -36,6 +36,28 @@ static constexpr float subdist_margin= 1.05f;
 static constexpr double subdist_stddev_threshold= 0.05;  // 3σ, p>99.9%
 static constexpr ulonglong subdist_stddev_valid= 10000;  // sufficient
 
+// Number of consecutive non-improving, nonempty layers tolerated while
+// expanding one node in the one-pass search.
+static constexpr uint flat_prune_patience= 1;
+
+// Greedily route sparse upper layers before starting the one-pass traversal.
+// The M=6 reference keeps the routed fraction near 1/6^5. For lower M, where
+// the one-pass search has shown its clearest benefit, disable the prefix.
+static uint flat_pruned_descent_stop(uint M)
+{
+  if (M < 6)
+    return UINT8_MAX;
+
+  static constexpr uint reference_population= 6 * 6 * 6 * 6 * 6;
+  uint stop= 0, population= 1;
+  while (population < reference_population)
+  {
+    population*= M;
+    stop++;
+  }
+  return stop;
+}
+
 /*
  The class below can assume normal distribution and only collect
  M1 and M2, or go beyond that and collect M3 and M4 to account
@@ -83,6 +105,7 @@ struct stats_collector
 struct Stats
 {
   double ef_power= 0.6;         // for the bloom filter size heuristic
+  double flat_ef_power= 0.6;    // the same, for one-pass searches
   float diameter= 0;
   size_t graph_size= 0;
   stats_collector subdist;
@@ -663,6 +686,7 @@ public:
     stats.graph_size+= addend.graph_size;
     stats.diameter= std::max(stats.diameter, addend.diameter);
     stats.ef_power= std::max(stats.ef_power, addend.ef_power);
+    stats.flat_ef_power= std::max(stats.flat_ef_power, addend.flat_ef_power);
     stats.subdist.add(addend.subdist);
     mysql_mutex_unlock(&cache_lock);
   }
@@ -1065,17 +1089,19 @@ struct MHNSW_param
   MHNSW_Share *ctx;
   TABLE *graph;
   int layer;
+  const int max_layer;
   Stats acc;
   dgt_mode mode;
   double max_est_size;
   MHNSW_param(MHNSW_Share *ctx, TABLE *graph, int layer)
-    : ctx(ctx), graph(graph), layer(layer)
+    : ctx(ctx), graph(graph), layer(layer), max_layer(layer)
   {
     Stats stats;
     ctx->read_stats(&stats);
     max_est_size= stats.graph_size/1.3;
     acc.diameter= stats.diameter;
     acc.ef_power= stats.ef_power;
+    acc.flat_ef_power= stats.flat_ef_power;
     if (ctx->use_subdist)
     {
       if (stats.subdist.n > subdist_stddev_valid)
@@ -1286,7 +1312,8 @@ static inline float lenient_furthest(const Queue<Visited> &q, float maxd, float 
   @param[in/out] inout    in: start nodes, out: result nodes
 */
 static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
-                        uint result_size, Neighborhood *inout, bool construction)
+                        uint result_size, Neighborhood *inout, bool construction,
+                        bool flat_pruned= false)
 {
   DBUG_ASSERT(inout->num > 0);
 
@@ -1309,8 +1336,13 @@ static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
   }
 
   // WARNING! heuristic here
-  const double est_heuristic= 8 * std::sqrt(p->ctx->max_neighbors(p->layer));
-  double est_size= est_heuristic * std::pow(ef, p->acc.ef_power);
+  uint neighbors_per_node= p->ctx->max_neighbors(p->layer);
+  if (flat_pruned)
+    for (int layer= 1; layer <= p->max_layer; layer++)
+      neighbors_per_node+= p->ctx->max_neighbors(layer);
+  double &ef_power= flat_pruned ? p->acc.flat_ef_power : p->acc.ef_power;
+  const double est_heuristic= 8 * std::sqrt(neighbors_per_node);
+  double est_size= est_heuristic * std::pow(ef, ef_power);
   est_size= std::min(est_size, p->max_est_size);
   VisitedSet visited(root, static_cast<uint>(est_size));
 
@@ -1337,60 +1369,90 @@ static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
     if (cur.distance_to_target > furthest_best && best.is_full())
       break; // All possible candidates are worse than what we have
 
-    visited.flush();
-
-    Neighborhood &neighbors= cur.node->neighbors[p->layer];
-    FVectorNode **links= neighbors.links, **end= links + neighbors.num;
-    for (; links < end; links+= 8)
+    const int start_layer= flat_pruned ? cur.node->max_layer : p->layer;
+    const int stop_layer= flat_pruned ? 0 : p->layer;
+    float prev_layer_min= FLT_MAX;
+    uint stall= 0;
+    for (int expand_layer= start_layer;
+         expand_layer >= stop_layer; expand_layer--)
     {
-      uint8_t res= visited.seen(links);
-      if (res == 0xff)
-        continue;
-
-      for (size_t i= 0; i < 8; i++)
+      visited.flush();
+      float layer_min= FLT_MAX;
+      Neighborhood &neighbors= cur.node->neighbors[expand_layer];
+      FVectorNode **links= neighbors.links, **end= links + neighbors.num;
+      for (; links < end; links+= 8)
       {
-        if (res & (1 << i))
+        uint8_t res= visited.seen(links);
+        if (res == 0xff)
           continue;
-        if (int err= links[i]->load(p->graph))
-          return err;
-        if (!best.is_full())
+
+        for (size_t i= 0; i < 8; i++)
         {
-          Visited *v= visited.create(links[i], links[i]->distance_to(target));
-          if (v->distance_to_target <= threshold)
+          FVectorNode *link= links[i];
+          if ((res & (1 << i)) || !link)
             continue;
-          p->acc.diameter= std::max(p->acc.diameter, v->distance_to_target);
-          candidates.safe_push(v);
-          if (skip_deleted && v->node->deleted)
-            continue;
-          best.push(v);
-          furthest_best= lenient_furthest(best, p->acc.diameter, leniency);
-        }
-        else
-        {
-          Visited *v= visited.create(links[i],
-                        links[i]->distance_greater_than(target, furthest_best,
-                                                        p->mode, &p->acc));
-          if (v->distance_to_target <= threshold)
-            continue;
-          if (v->distance_to_target < furthest_best)
+          if (int err= link->load(p->graph))
+            return err;
+          if (!best.is_full())
           {
+            Visited *v= visited.create(link, link->distance_to(target));
+            layer_min= std::min(layer_min, v->distance_to_target);
+            if (v->distance_to_target <= threshold)
+              continue;
+            p->acc.diameter= std::max(p->acc.diameter, v->distance_to_target);
             candidates.safe_push(v);
             if (skip_deleted && v->node->deleted)
               continue;
-            if (v->distance_to_target < best.top()->distance_to_target)
+            best.push(v);
+            furthest_best= lenient_furthest(best, p->acc.diameter, leniency);
+          }
+          else
+          {
+            Visited *v= visited.create(link,
+                          link->distance_greater_than(target, furthest_best,
+                                                      p->mode, &p->acc));
+            layer_min= std::min(layer_min, v->distance_to_target);
+            if (v->distance_to_target <= threshold)
+              continue;
+            if (v->distance_to_target < furthest_best)
             {
-              best.replace_top(v);
-              furthest_best= lenient_furthest(best, p->acc.diameter, leniency);
+              candidates.safe_push(v);
+              if (skip_deleted && v->node->deleted)
+                continue;
+              if (v->distance_to_target < best.top()->distance_to_target)
+              {
+                best.replace_top(v);
+                furthest_best= lenient_furthest(best, p->acc.diameter, leniency);
+              }
             }
           }
+        }
+      }
+
+      /*
+        Stop after more than flat_prune_patience consecutive nonempty layers
+        whose closest newly discovered neighbor does not improve on the best
+        minimum seen in a higher layer. Empty layers carry no pruning signal.
+      */
+      if (flat_pruned && layer_min != FLT_MAX)
+      {
+        if (layer_min >= prev_layer_min)
+        {
+          if (++stall > flat_prune_patience)
+            break;
+        }
+        else
+        {
+          stall= 0;
+          prev_layer_min= layer_min;
         }
       }
     }
   }
   if (ef > 1 && visited.count > est_size)
   {
-    double ef_power= std::log(visited.count/est_heuristic) / std::log(ef);
-    p->acc.ef_power= std::max(p->acc.ef_power, ef_power);
+    double new_power= std::log(visited.count/est_heuristic) / std::log(ef);
+    ef_power= std::max(ef_power, new_power);
   }
 
   while (best.elements() > result_size)
@@ -1509,11 +1571,15 @@ struct Search_context: public Sql_alloc
   Neighborhood found;
   MHNSW_Share *ctx;
   const FVector *target;
+  const bool flat_pruned;
+  const int max_layer;
   ulonglong ctx_version;
   size_t pos= 0;
   float threshold= NEAREST/2;
-  Search_context(Neighborhood *n, MHNSW_Share *s, const FVector *v)
-    : found(*n), ctx(s->dup(false)), target(v), ctx_version(ctx->version) {}
+  Search_context(Neighborhood *n, MHNSW_Share *s, const FVector *v,
+                 bool flat_pruned, int max_layer)
+    : found(*n), ctx(s->dup(false)), target(v), flat_pruned(flat_pruned),
+      max_layer(max_layer), ctx_version(ctx->version) {}
 };
 
 
@@ -1565,25 +1631,46 @@ int mhnsw_read_first(TABLE *table, KEY *keyinfo, Item *dist, ulonglong limit)
     return err;
 
   MHNSW_param p(ctx, graph, candidates.links[0]->max_layer);
+  bool flat_pruned= false;
+  DBUG_EXECUTE_IF("mhnsw_flat_pruned", flat_pruned= true;);
 
-  for (; p.layer > 0; p.layer--)
+  if (flat_pruned)
   {
-    if (int err= search_layer(&p, target, NEAREST, 1, &candidates, false))
+    // Greedily route only the sparse upper prefix, then traverse every layer
+    // of each candidate in one search rooted at layer 0.
+    const int stop_layer= static_cast<int>(flat_pruned_descent_stop(ctx->M));
+    for (; p.layer > stop_layer; p.layer--)
     {
-      graph->file->ha_rnd_end();
-      return err;
+      if (int err= search_layer(&p, target, NEAREST, 1, &candidates, false))
+      {
+        graph->file->ha_rnd_end();
+        return err;
+      }
+    }
+    p.layer= 0;
+  }
+  else
+  {
+    for (; p.layer > 0; p.layer--)
+    {
+      if (int err= search_layer(&p, target, NEAREST, 1, &candidates, false))
+      {
+        graph->file->ha_rnd_end();
+        return err;
+      }
     }
   }
 
   if (int err= search_layer(&p, target, NEAREST, static_cast<uint>(limit),
-                            &candidates, false))
+                            &candidates, false, flat_pruned))
   {
     graph->file->ha_rnd_end();
     return err;
   }
   ctx->add_to_stats(p.acc);
 
-  auto result= new (thd->mem_root) Search_context(&candidates, ctx, target);
+  auto result= new (thd->mem_root)
+    Search_context(&candidates, ctx, target, flat_pruned, p.max_layer);
   graph->context= result;
 
   return mhnsw_read_next(table);
@@ -1631,9 +1718,11 @@ int mhnsw_read_next(TABLE *table)
   }
 
   float new_threshold= result->found.links[result->found.num-1]->distance_to(result->target);
-  MHNSW_param p(ctx, graph, 0);
+  MHNSW_param p(ctx, graph, result->max_layer);
+  p.layer= 0;
   if (int err= search_layer(&p, result->target, result->threshold,
-                            static_cast<uint>(result->pos), &result->found, false))
+                            static_cast<uint>(result->pos), &result->found,
+                            false, result->flat_pruned))
     return err;
   result->pos= 0;
   result->threshold= new_threshold + FLT_EPSILON;
