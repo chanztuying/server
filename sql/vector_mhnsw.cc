@@ -1169,6 +1169,12 @@ class VisitedSet
     count++;
     return v;
   }
+  void remember(FVectorNode *node)
+  {
+    // Mark a distance-tested node without materialising a queue entry.
+    insert(node);
+    count++;
+  }
   void insert(const FVectorNode *n)
   {
     nodes[idx++]= n;
@@ -1402,6 +1408,11 @@ static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
          expand_layer >= stop_layer; expand_layer--)
     {
       visited.flush();
+      // The terminal layer has no lower layer whose expansion can be pruned.
+      // Avoid maintaining a minimum there. This removes the bookkeeping from
+      // the dominant flat-search case, because most graph nodes only have
+      // layer 0, while leaving the hierarchical path unchanged.
+      const bool track_layer_min= !flat || expand_layer > stop_layer;
       float layer_min= FLT_MAX;   // min distance among NEW neighbors of this layer
       Neighborhood &neighbors= cur.node->neighbors[expand_layer];
       FVectorNode **links= neighbors.links, **end= links + neighbors.num;
@@ -1433,7 +1444,8 @@ static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
           if (!best.is_full())
           {
             Visited *v= visited.create(link, link->distance_to(target));
-            layer_min= std::min(layer_min, v->distance_to_target);
+            if (track_layer_min)
+              layer_min= std::min(layer_min, v->distance_to_target);
             if (v->distance_to_target <= threshold)
               continue;
             p->acc.diameter= std::max(p->acc.diameter, v->distance_to_target);
@@ -1445,23 +1457,34 @@ static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
           }
           else
           {
-            Visited *v= visited.create(link,
-                          link->distance_greater_than(target, furthest_best,
-                                                      p->mode, &p->acc));
-            layer_min= std::min(layer_min, v->distance_to_target);
-            if (v->distance_to_target <= threshold)
-              continue;
-            if (v->distance_to_target < furthest_best)
+            float distance= link->distance_greater_than(target, furthest_best,
+                                                        p->mode, &p->acc);
+            if (track_layer_min)
+              layer_min= std::min(layer_min, distance);
+            if (distance <= threshold)
             {
+              if (flat)
+                visited.remember(link);
+              else
+                (void) visited.create(link, distance);
+              continue;
+            }
+            if (distance < furthest_best)
+            {
+              Visited *v= visited.create(link, distance);
               candidates.safe_push(v);
               if (skip_deleted && v->node->deleted)
                 continue;
-              if (v->distance_to_target < best.top()->distance_to_target)
+              if (distance < best.top()->distance_to_target)
               {
                 best.replace_top(v);
                 furthest_best= lenient_furthest(best, p->acc.diameter, leniency);
               }
             }
+            else if (flat)
+              visited.remember(link);
+            else
+              (void) visited.create(link, distance);
           }
         }
       }
