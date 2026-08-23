@@ -1165,13 +1165,11 @@ class VisitedSet
   Visited *create(FVectorNode *node, float dist)
   {
     auto *v= new (root) Visited(node, dist);
-    insert(node);
-    count++;
+    remember(node);
     return v;
   }
   void remember(FVectorNode *node)
   {
-    // Mark a distance-tested node without materialising a queue entry.
     insert(node);
     count++;
   }
@@ -1408,10 +1406,7 @@ static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
          expand_layer >= stop_layer; expand_layer--)
     {
       visited.flush();
-      // The terminal layer has no lower layer whose expansion can be pruned.
-      // Avoid maintaining a minimum there. This removes the bookkeeping from
-      // the dominant flat-search case, because most graph nodes only have
-      // layer 0, while leaving the hierarchical path unchanged.
+      // No lower layer remains to prune after the terminal layer.
       const bool track_layer_min= !flat || expand_layer > stop_layer;
       float layer_min= FLT_MAX;   // min distance among NEW neighbors of this layer
       Neighborhood &neighbors= cur.node->neighbors[expand_layer];
@@ -1461,30 +1456,20 @@ static int search_layer(MHNSW_param *p, const FVector *target, float threshold,
                                                         p->mode, &p->acc);
             if (track_layer_min)
               layer_min= std::min(layer_min, distance);
-            if (distance <= threshold)
+            if (distance <= threshold || !(distance < furthest_best))
             {
-              if (flat)
-                visited.remember(link);
-              else
-                (void) visited.create(link, distance);
+              visited.remember(link);
               continue;
             }
-            if (distance < furthest_best)
+            Visited *v= visited.create(link, distance);
+            candidates.safe_push(v);
+            if (skip_deleted && v->node->deleted)
+              continue;
+            if (distance < best.top()->distance_to_target)
             {
-              Visited *v= visited.create(link, distance);
-              candidates.safe_push(v);
-              if (skip_deleted && v->node->deleted)
-                continue;
-              if (distance < best.top()->distance_to_target)
-              {
-                best.replace_top(v);
-                furthest_best= lenient_furthest(best, p->acc.diameter, leniency);
-              }
+              best.replace_top(v);
+              furthest_best= lenient_furthest(best, p->acc.diameter, leniency);
             }
-            else if (flat)
-              visited.remember(link);
-            else
-              (void) visited.create(link, distance);
           }
         }
       }
